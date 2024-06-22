@@ -1,0 +1,213 @@
+# -*- coding: utf-8 -*-
+
+"""
+@contact: 微信 1257309054
+@file: recommend_ncf.py
+@time: 2024/6/16 22:13
+@author: LDC
+"""
+import os
+import django
+import joblib
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from sklearn.metrics import classification_report
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from keras.models import load_model
+
+os.environ["DJANGO_SETTINGS_MODULE"] = "book_manager.settings"
+django.setup()
+from book.models import *
+
+
+def get_all_data():
+    '''
+    从数据库中获取所有物品评分数据
+    [用户特征(点赞，收藏，评论,
+    物品特征(收藏人数,点赞人数,浏览量,评分人数,平均评分)
+    ]
+    '''
+    # 定义字典列表
+    user_book_list = []
+    # 从评分表中获取所有图书数据
+    book_rates = RateBook.objects.all().values('book_id').distinct()
+    # 获取每个用户的评分数据
+    for user in User.objects.all():
+        user_rate = RateBook.objects.filter(user=user)
+        if not user_rate:
+            # 用户如果没有评分过任何一本图书则跳过循环
+            continue
+        data = {'User': f'user_{user.id}'}
+        for br in book_rates:
+            book_id = br['book_id']
+            ur = user_rate.filter(book_id=book_id)
+            if ur:
+                data[f'book_{book_id}'] = ur.first().mark  # 对应图书的评分
+            else:
+                data[f'book_{book_id}'] = np.nan  # 设置成空
+        user_book_list.append(data)
+    data_pd = pd.DataFrame.from_records(user_book_list)
+    print(data_pd)
+    return data_pd
+
+
+def get_data_vector(data):
+    '''
+    对矩阵进行向量化，便于神经网络学习
+    '''
+    user_index = data[data.columns[0]]
+    data = data.reset_index(drop=True)
+    data[data.columns[0]] = data.index.astype('int')
+    scaler = 5  # 评分最高为5，把用户的评分归一化到0-1
+
+    df_vector = pd.melt(data, id_vars=[data.columns[0]],
+                        ignore_index=True,
+                        var_name='book_id',
+                        value_name='rate').dropna()
+    df_vector.columns = ['user_id', 'book_id', 'rating']
+    df_vector['rating'] = df_vector['rating'] / scaler
+    df_vector['user_id'] = df_vector['user_id'].apply(lambda x: user_index[x])
+    print(df_vector)
+    return df_vector
+
+
+def evaluation(y_true, y_pred):
+    '''
+    模型评估：获取准确率、精准度、召回率、F1-score值
+    y_true：正确标签
+    y_pred：预测标签
+    '''
+    accuracy = round(classification_report(y_true, y_pred, output_dict=True)['accuracy'], 3)  # 准确率
+    s = classification_report(y_true, y_pred, output_dict=True)['weighted avg']
+    precision = round(s['precision'], 3)  # 精准度
+    recall = round(s['recall'], 3)  # 召回率
+    f1_score = round(s['f1-score'], 3)  # F1-score
+    print('神经网络协同推荐(NCF):准确率是{},精准度是{},召回率是{},F1值是{}'.format(accuracy, precision, recall, f1_score))
+    return accuracy, precision, recall, f1_score
+
+
+def get_data_fit(df_vector):
+    '''
+    数据训练，得到模型
+    '''
+    scaler = 5  # 特征标准化：最高分为5，需要归一化到0~1
+    dataset = df_vector  # 已向量化的数据集
+    # 使用LabelEncoder将字符串标签转换为整数标签
+    user_encoder = LabelEncoder()
+    book_encoder = LabelEncoder()
+    dataset['user_id'] = user_encoder.fit_transform(dataset['user_id'])
+    dataset['book_id'] = book_encoder.fit_transform(dataset['book_id'])
+
+    # Split the dataset into train and test sets
+    train, test = train_test_split(dataset, test_size=0.2, random_state=42)  # 划分训练集与测试集
+    # train = dataset
+
+    # Model hyperparameters
+    num_users = len(dataset['user_id'].unique())
+    num_countries = len(dataset['book_id'].unique())
+
+    embedding_dim = 64  # 64维向量标识
+
+    # 创建NCF模型
+    inputs_user = tf.keras.layers.Input(shape=(1,))
+    inputs_book = tf.keras.layers.Input(shape=(1,))
+    embedding_user = tf.keras.layers.Embedding(num_users, embedding_dim)(inputs_user)
+    embedding_book = tf.keras.layers.Embedding(num_countries, embedding_dim)(inputs_book)
+
+    # 合并 embeddings向量
+    merged = tf.keras.layers.Concatenate()([embedding_user, embedding_book])
+    merged = tf.keras.layers.Flatten()(merged)
+
+    # 添加全连接层
+    dense = tf.keras.layers.Dense(64, activation='relu')(merged)
+    dense = tf.keras.layers.Dense(32, activation='relu')(dense)
+    output = tf.keras.layers.Dense(1, activation='sigmoid')(dense)
+
+    # 编译模型
+    model = tf.keras.Model(inputs=[inputs_user, inputs_book], outputs=output)
+    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+    # 模型训练
+    model.fit(
+        [train['user_id'].values, train['book_id'].values],
+        train['rating'].values,
+        batch_size=64,
+        epochs=100,
+        verbose=0,
+        # validation_split=0.1,
+    )
+
+
+    book_rates = RateBook.objects.all().values('book_id').distinct()
+    # 获取每个用户的评分数据
+    result_df = {}
+    for user in User.objects.all():
+        user_rate = RateBook.objects.filter(user=user)
+        if not user_rate:
+            # 用户如果没有评分过任何一本图书则跳过循环
+            continue
+        user = f'user_{user.id}'
+        result_df[user] = {}
+        for br in book_rates:
+            book_id = br['book_id']
+            book = f'book_{book_id}'
+            pred_user_id = user_encoder.transform([user])
+            pred_book_id = book_encoder.transform([book])
+            result = model.predict(x=[pred_user_id, pred_book_id], verbose=0)
+            result_df[user][book] = result[0][0]
+    result_df = pd.DataFrame(result_df).T
+    result_df *= scaler
+
+    print('全部用户预测结果', result_df)
+
+    # 预测测试集并转成整形列表
+    y_pred_ = np.floor(model.predict(x=[test['user_id'], test['book_id']], verbose=0) * scaler).tolist()
+    y_pred = []
+    for y in y_pred_:
+        y_pred.append(int(y[0]))
+    y_true = (test['rating'] * scaler).tolist()
+    evaluation(y_true, y_pred)  # 模型评估
+    joblib.dump(user_encoder, 'user_encoder.pkl')  # 保存用户标签
+    joblib.dump(book_encoder, 'book_encoder.pkl')  # 保存图书标签
+    model.save('ncf.dat')  # 模型保存
+
+def get_ncf_recommend(user_id, n=10):
+    '''
+    # 获取推荐
+    user_id:用户id
+    n:只取前十个推荐结果
+    '''
+    scaler = 5  # 特征标准化：最高分为5，需要归一化到0~1
+    model = load_model('ncf.dat')  # 加载模型
+    # 加载标签
+    user_encoder = joblib.load('user_encoder.pkl')
+    book_encoder = joblib.load('book_encoder.pkl')
+
+    result_df = {}
+    book_rates = RateBook.objects.all().values('book_id').distinct()
+    for book in book_rates:
+        book_id = book['book_id']
+        user = f'user_{user_id}'
+        book = f"book_{book_id}"
+        pred_user_id = user_encoder.transform([user])
+        pred_book_id = book_encoder.transform([book])
+        result = model.predict(x=[pred_user_id, pred_book_id], verbose=0)
+        if not RateBook.objects.filter(user_id=user_id, book_id=book_id):
+            # 过滤掉用户已评分过的
+            result_df[book_id] = result[0][0] * scaler
+    result_df_sort = sorted(result_df.items(), key=lambda x: x[1], reverse=True)  # 推荐结果按照评分降序排列
+    print('预测结果', result_df_sort)
+    recommend_ids = []
+    for rds in result_df_sort[:n]:
+        recommend_ids.append(rds[0])
+    print(f'前{n}个推荐结果', recommend_ids)
+    return recommend_ids
+
+
+if __name__ == '__main__':
+    data_pd = get_all_data()  # 获取数据
+    df_vector = get_data_vector(data_pd)  # 数据向量化
+    data_recommend = get_data_fit(df_vector)  # 获取数据训练模型
+    user_id = 1
+    recommend_ids = get_ncf_recommend(user_id)  # 获取用户1的推荐结果
